@@ -9,6 +9,7 @@
 
 import http from 'http';
 import https from 'https';
+import { createHash } from 'crypto';
 import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -35,8 +36,8 @@ const DB_PATH = process.env.DIGEST_DB || env.DIGEST_DB || join(ROOT, 'data', 'di
 mkdirSync(join(ROOT, 'data'), { recursive: true });
 const db = getDb(DB_PATH);
 
-const LOOP_INTERVAL = parseInt(env.COLLECTOR_INTERVAL || '300') * 1000;
-const CONCURRENCY = parseInt(env.COLLECTOR_CONCURRENCY || '5');
+const LOOP_INTERVAL = parseInt(process.env.COLLECTOR_INTERVAL || env.COLLECTOR_INTERVAL || '300', 10) * 1000;
+const CONCURRENCY = parseInt(process.env.COLLECTOR_CONCURRENCY || env.COLLECTOR_CONCURRENCY || '5', 10);
 const UA = 'ClawFeed-Collector/1.0';
 
 // ── SSRF protection ──
@@ -45,7 +46,11 @@ function isPrivateOrSpecialIp(ip) {
   if (!ip) return true;
   if (ip.includes(':')) {
     const n = ip.toLowerCase();
-    return n === '::1' || n.startsWith('fc') || n.startsWith('fd') || n.startsWith('fe80:') || n.startsWith('::ffff:127.');
+    if (n === '::1' || n.startsWith('fc') || n.startsWith('fd') || n.startsWith('fe80:')) return true;
+    // IPv6-mapped IPv4 (::ffff:x.x.x.x) — extract the IPv4 and check it
+    const v4Mapped = n.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4Mapped) return isPrivateOrSpecialIp(v4Mapped[1]);
+    return false;
   }
   const p = ip.split('.').map(Number);
   if (p.length !== 4 || p.some((x) => Number.isNaN(x) || x < 0 || x > 255)) return true;
@@ -54,30 +59,38 @@ function isPrivateOrSpecialIp(ip) {
     (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
 }
 
-async function assertSafeUrl(rawUrl) {
+async function resolveAndValidateUrl(rawUrl) {
   const u = new URL(rawUrl);
   if (!['http:', 'https:'].includes(u.protocol)) throw new Error('invalid url scheme');
   const host = u.hostname;
   if (host === 'localhost' || host.endsWith('.localhost')) throw new Error('blocked host');
-  if (isIP(host) && isPrivateOrSpecialIp(host)) throw new Error('blocked host');
+  if (isIP(host)) {
+    if (isPrivateOrSpecialIp(host)) throw new Error('blocked host');
+    return { url: u, resolvedIp: host };
+  }
   const resolved = await lookup(host, { all: true });
   if (!resolved.length || resolved.some((r) => isPrivateOrSpecialIp(r.address))) {
     throw new Error('blocked host');
   }
+  return { url: u, resolvedIp: resolved[0].address, resolvedFamily: resolved[0].family };
 }
 
 // ── HTTP helper ──
 
 function httpGet(url, { timeout = 10000, maxBytes = 500000, redirectsLeft = 3 } = {}) {
   return new Promise(async (resolve, reject) => {
+    let safe;
     try {
-      await assertSafeUrl(url);
+      safe = await resolveAndValidateUrl(url);
     } catch (e) {
       return reject(e);
     }
     const mod = url.startsWith('https') ? https : http;
-    const r = mod.get(url, { headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/xml,application/json,*/*' } }, async (resp) => {
+    // Pin DNS to the already-resolved IP to prevent DNS rebinding (TOCTOU)
+    const pinnedLookup = (_hostname, _opts, cb) => cb(null, safe.resolvedIp, safe.resolvedFamily || 4);
+    const r = mod.get(url, { headers: { 'User-Agent': UA, Accept: 'text/html,application/xhtml+xml,application/xml,application/json,*/*' }, lookup: pinnedLookup }, async (resp) => {
       try {
+        resp.setEncoding('utf8');
         if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
           clearTimeout(timer);
           if (redirectsLeft <= 0) return reject(new Error('too many redirects'));
@@ -121,7 +134,7 @@ async function fetchRss(source) {
     const title = extractXmlTag(block, 'title');
     const link = extractXmlLink(block);
     const author = extractXmlTag(block, 'author') || extractXmlTag(block, 'dc:creator') || '';
-    const description = extractXmlTag(block, 'description') || extractXmlTag(block, 'summary') || extractXmlTag(block, 'content') || '';
+    const description = extractXmlTag(block, 'content:encoded') || extractXmlTag(block, 'description') || extractXmlTag(block, 'summary') || extractXmlTag(block, 'content') || '';
     const pubDate = extractXmlTag(block, 'pubDate') || extractXmlTag(block, 'published') || extractXmlTag(block, 'updated') || '';
 
     items.push({
@@ -411,8 +424,19 @@ if (args.includes('--source')) {
   console.log(JSON.stringify(result, null, 2));
 } else if (args.includes('--loop')) {
   console.log(`[collector] Starting loop (interval: ${LOOP_INTERVAL / 1000}s, concurrency: ${CONCURRENCY})`);
+  let running = true;
+  const shutdown = (sig) => {
+    if (!running) return;
+    running = false;
+    console.log(`[collector] ${sig} received, shutting down gracefully...`);
+    clearInterval(loopTimer);
+    db.close();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
   await collectAll();
-  setInterval(collectAll, LOOP_INTERVAL);
+  const loopTimer = setInterval(() => { if (running) collectAll(); }, LOOP_INTERVAL);
 } else {
   const results = await collectAll();
   console.log(`\n[collector] Done. ${results.length} source(s) processed.`);

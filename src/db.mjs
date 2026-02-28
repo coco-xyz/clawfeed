@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -471,12 +472,7 @@ export function insertRawItemsBatch(db, sourceId, items) {
 }
 
 function _contentHash(content) {
-  let h = 0;
-  const s = (content || '').slice(0, 500);
-  for (let i = 0; i < s.length; i++) {
-    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
-  }
-  return 'hash:' + (h >>> 0).toString(36);
+  return 'sha256:' + createHash('sha256').update(content || '').digest('hex').slice(0, 16);
 }
 
 export function listRawItems(db, { sourceId, since, limit = 100, offset = 0 } = {}) {

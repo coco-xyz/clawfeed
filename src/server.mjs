@@ -825,16 +825,25 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && path === '/api/raw-items') {
       if (!req.user) return json(res, { error: 'login required' }, 401);
-      const sourceId = params.get('source_id') ? parseInt(params.get('source_id')) : undefined;
+      // Scope to user's subscribed sources only (no cross-user source access)
+      const subs = listSubscriptions(db, req.user.id);
+      const userSourceIds = new Set(subs.filter(s => !s.is_deleted).map(s => s.id));
+      const sourceId = params.get('source_id') ? parseInt(params.get('source_id'), 10) : undefined;
+      if (sourceId && !userSourceIds.has(sourceId)) return json(res, { error: 'source not found' }, 404);
       const since = params.get('since') || undefined;
-      const limit = Math.min(parseInt(params.get('limit') || '50'), 200);
-      const offset = parseInt(params.get('offset') || '0');
-      return json(res, listRawItems(db, { sourceId, since, limit, offset }));
+      const limit = Math.min(parseInt(params.get('limit') || '50', 10), 200);
+      const offset = parseInt(params.get('offset') || '0', 10);
+      const effectiveSourceId = sourceId || undefined;
+      const items = listRawItems(db, { sourceId: effectiveSourceId, since, limit, offset });
+      return json(res, effectiveSourceId ? items : items.filter(i => userSourceIds.has(i.source_id)));
     }
 
     if (req.method === 'GET' && path === '/api/raw-items/stats') {
       if (!req.user) return json(res, { error: 'login required' }, 401);
-      return json(res, getRawItemStats(db));
+      const subs = listSubscriptions(db, req.user.id);
+      const userSourceIds = new Set(subs.filter(s => !s.is_deleted).map(s => s.id));
+      const stats = getRawItemStats(db);
+      return json(res, stats.filter(s => userSourceIds.has(s.source_id)));
     }
 
     if (req.method === 'GET' && path === '/api/raw-items/for-digest') {
