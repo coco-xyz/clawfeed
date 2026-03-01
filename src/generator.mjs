@@ -395,10 +395,17 @@ async function generateSystemDigest(db, type, dryRun) {
   }
 
   const since = lastSystem?.created_at || undefined;
-  const items = listRawItemsForDigest(db, sourceIds, { since, limit: MAX_ITEMS });
-  if (!items.length) {
+  const rawItems = listRawItemsForDigest(db, sourceIds, { since, limit: MAX_ITEMS });
+  if (!rawItems.length) {
     console.log('  [skip] No new items for system digest');
     return null;
+  }
+
+  // Cross-source deduplication
+  const items = deduplicateItems(rawItems);
+  const dedupCount = rawItems.length - items.length;
+  if (dedupCount > 0) {
+    console.log(`  [dedup] System digest: ${dedupCount} duplicates removed`);
   }
 
   console.log(`  [gen] System digest: ${items.length} items from ${sourceIds.length} public sources`);

@@ -845,10 +845,13 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
       const body = await parseBody(req);
       const { sourceId, weight } = body;
       if (!sourceId) return json(res, { error: 'sourceId required' }, 400);
+      const sid = parseInt(sourceId, 10);
+      if (isNaN(sid)) return json(res, { error: 'sourceId must be a number' }, 400);
       const w = parseFloat(weight);
       if (isNaN(w) || w < 0 || w > 5) return json(res, { error: 'weight must be 0-5' }, 400);
-      setSubscriptionWeight(db, req.user.id, sourceId, w);
-      return json(res, { ok: true, sourceId, weight: w });
+      const result = setSubscriptionWeight(db, req.user.id, sid, w);
+      if (!result.changes) return json(res, { error: 'subscription not found' }, 404);
+      return json(res, { ok: true, sourceId: sid, weight: w });
     }
 
     // ── Item Feedback ──
@@ -869,8 +872,10 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
       const body = await parseBody(req);
       const { itemUrl, itemTitle, signal } = body;
       if (!itemUrl) return json(res, { error: 'itemUrl required' }, 400);
+      if (typeof itemUrl !== 'string' || itemUrl.length > 2048) return json(res, { error: 'itemUrl too long (max 2048)' }, 400);
+      if (itemTitle && (typeof itemTitle !== 'string' || itemTitle.length > 500)) return json(res, { error: 'itemTitle too long (max 500)' }, 400);
       if (!signal || !['helpful', 'not_helpful'].includes(signal)) return json(res, { error: 'signal must be helpful or not_helpful' }, 400);
-      upsertItemFeedback(db, req.user.id, itemUrl, itemTitle || '', signal);
+      upsertItemFeedback(db, req.user.id, itemUrl, (itemTitle || '').slice(0, 500), signal);
       return json(res, { ok: true });
     }
 
@@ -887,8 +892,8 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
       const { topic, score } = body;
       if (!topic || typeof topic !== 'string' || !topic.trim()) return json(res, { error: 'topic required' }, 400);
       if (topic.trim().length > 100) return json(res, { error: 'topic too long' }, 400);
-      const s = parseFloat(score) || 1.0;
-      if (s < 0 || s > 5) return json(res, { error: 'score must be 0-5' }, 400);
+      const s = score !== undefined && score !== null ? parseFloat(score) : 1.0;
+      if (isNaN(s) || s < 0 || s > 5) return json(res, { error: 'score must be 0-5' }, 400);
       upsertUserTopic(db, req.user.id, topic.trim(), s, 'manual');
       return json(res, { ok: true });
     }

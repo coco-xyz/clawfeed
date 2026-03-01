@@ -160,8 +160,8 @@ export function getDb(dbPath) {
   }
   // Migration 015: digest quality (source weights, item feedback, topics)
   try {
-    const sql14 = readFileSync(join(ROOT, 'migrations', '015_digest_quality.sql'), 'utf8');
-    for (const stmt of sql14.split(';').map(s => s.trim()).filter(Boolean)) {
+    const sql15 = readFileSync(join(ROOT, 'migrations', '015_digest_quality.sql'), 'utf8');
+    for (const stmt of sql15.split(';').map(s => s.trim()).filter(Boolean)) {
       try { _db.exec(stmt + ';'); } catch (e) {
         if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) throw e;
       }
