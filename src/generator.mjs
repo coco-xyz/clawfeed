@@ -26,10 +26,14 @@ import {
   getActiveSubscriptionSourceIds,
   getLastDigestTime,
   listRawItemsForDigest,
+  listRawItemsForDigestWeighted,
   createDigest,
   listSources,
   getUsersWithTelegramForDigest,
   getUserMarkTopics,
+  getRecentHelpfulUrls,
+  getRecentNotHelpfulUrls,
+  getUserTopics,
 } from './db.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -140,25 +144,127 @@ function callLlm(systemPrompt, userContent) {
 function formatItemsForLlm(items) {
   return items.map((item, i) => {
     const parts = [`[${i + 1}] ${item.title || '(untitled)'}`];
-    if (item.source_name) parts.push(`Source: ${item.source_name} (${item.source_type})`);
+    if (item.source_name) {
+      let srcLabel = `Source: ${item.source_name} (${item.source_type})`;
+      if (item._cross_source) srcLabel += ' [multi-source]';
+      parts.push(srcLabel);
+    }
     if (item.author) parts.push(`Author: ${item.author}`);
     if (item.url) parts.push(`URL: ${item.url}`);
     if (item.content) parts.push(item.content.slice(0, 500));
     if (item.published_at) parts.push(`Published: ${item.published_at}`);
     // Include metadata signals (scores, upvotes, etc.)
+    const signals = [];
     if (item.metadata && item.metadata !== '{}') {
       try {
         const meta = typeof item.metadata === 'string' ? JSON.parse(item.metadata) : item.metadata;
-        const signals = [];
         if (meta.score) signals.push(`score: ${meta.score}`);
         if (meta.upvotes) signals.push(`upvotes: ${meta.upvotes}`);
         if (meta.comments) signals.push(`comments: ${meta.comments}`);
         if (meta.stars) signals.push(`stars: ${meta.stars}`);
-        if (signals.length) parts.push(`Signals: ${signals.join(', ')}`);
       } catch {}
     }
+    // Include source weight signal
+    const w = item.source_weight;
+    if (w !== undefined && w !== 1.0) signals.push(`source_weight: ${w}`);
+    if (signals.length) parts.push(`Signals: ${signals.join(', ')}`);
     return parts.join('\n');
   }).join('\n\n---\n\n');
+}
+
+// ── Cross-source deduplication ──
+function normalizeUrl(url) {
+  if (!url) return '';
+  try {
+    const u = new URL(url);
+    // Strip tracking params, trailing slashes, www prefix
+    u.searchParams.delete('utm_source');
+    u.searchParams.delete('utm_medium');
+    u.searchParams.delete('utm_campaign');
+    u.searchParams.delete('utm_content');
+    u.searchParams.delete('utm_term');
+    u.searchParams.delete('ref');
+    u.searchParams.delete('source');
+    let path = u.pathname.replace(/\/+$/, '') || '/';
+    let host = u.hostname.replace(/^www\./, '');
+    return `${host}${path}${u.search}`.toLowerCase();
+  } catch {
+    return url.toLowerCase().trim();
+  }
+}
+
+function deduplicateItems(items) {
+  const groups = new Map(); // normalized URL → [items]
+  const noUrl = [];
+
+  for (const item of items) {
+    if (!item.url) { noUrl.push(item); continue; }
+    const key = normalizeUrl(item.url);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+
+  const deduped = [];
+  for (const [, group] of groups) {
+    if (group.length === 1) {
+      deduped.push(group[0]);
+      continue;
+    }
+    // Pick best item: highest source_weight, then highest metadata score
+    group.sort((a, b) => {
+      const wa = a.source_weight || 1;
+      const wb = b.source_weight || 1;
+      if (wb !== wa) return wb - wa;
+      const sa = _metaScore(a);
+      const sb = _metaScore(b);
+      return sb - sa;
+    });
+    const best = { ...group[0] };
+    // Combine source names for context
+    const sources = [...new Set(group.map(i => i.source_name))];
+    if (sources.length > 1) {
+      best.source_name = sources.join(', ');
+      best._cross_source = true;
+    }
+    deduped.push(best);
+  }
+
+  return [...deduped, ...noUrl];
+}
+
+function _metaScore(item) {
+  try {
+    const meta = typeof item.metadata === 'string' ? JSON.parse(item.metadata) : (item.metadata || {});
+    return (meta.score || 0) + (meta.upvotes || 0) + (meta.comments || 0) + (meta.stars || 0);
+  } catch { return 0; }
+}
+
+// ── Build user preference context for LLM ──
+function buildUserPreferenceContext(db, userId) {
+  const parts = [];
+
+  // Topics
+  const topics = getUserTopics(db, userId);
+  if (topics.length) {
+    const topicList = topics.map(t => `${t.topic} (interest: ${t.score.toFixed(1)})`).join(', ');
+    parts.push(`User interests: ${topicList}`);
+  }
+
+  // Helpful items (what user liked)
+  const helpful = getRecentHelpfulUrls(db, userId, 10);
+  if (helpful.length) {
+    const titles = helpful.map(h => h.item_title || h.item_url).join('; ');
+    parts.push(`User recently marked as helpful: ${titles}`);
+  }
+
+  // Not helpful (what user disliked)
+  const notHelpful = getRecentNotHelpfulUrls(db, userId, 10);
+  if (notHelpful.length) {
+    const titles = notHelpful.map(h => h.item_title || h.item_url).join('; ');
+    parts.push(`User recently marked as not helpful (avoid similar): ${titles}`);
+  }
+
+  return parts.length ? '\n\n## User Preferences\n' + parts.join('\n') : '';
 }
 
 // ── Subscription hash for caching ──
@@ -178,10 +284,18 @@ async function generateForUser(db, userId, userName, type, dryRun) {
   const lastDigest = getLastDigestTime(db, userId, type);
   const since = lastDigest || undefined;
 
-  const items = listRawItemsForDigest(db, sourceIds, { since, limit: MAX_ITEMS });
-  if (!items.length) {
+  // Fetch items with per-source weights
+  const rawItems = listRawItemsForDigestWeighted(db, userId, sourceIds, { since, limit: MAX_ITEMS });
+  if (!rawItems.length) {
     console.log(`  [skip] ${userName || userId}: no new items since last digest`);
     return null;
+  }
+
+  // Cross-source deduplication
+  const items = deduplicateItems(rawItems);
+  const dedupCount = rawItems.length - items.length;
+  if (dedupCount > 0) {
+    console.log(`  [dedup] ${userName || userId}: ${dedupCount} duplicates removed`);
   }
 
   console.log(`  [gen] ${userName || userId}: ${items.length} items from ${sourceIds.length} sources`);
@@ -190,10 +304,13 @@ async function generateForUser(db, userId, userName, type, dryRun) {
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-SG', { timeZone: 'Asia/Singapore' });
   const timeStr = now.toLocaleTimeString('en-SG', { timeZone: 'Asia/Singapore', hour: '2-digit', minute: '2-digit', hour12: false });
+
+  // Inject user preference context into system prompt
+  const prefContext = buildUserPreferenceContext(db, userId);
   let systemPrompt = promptTemplate
     .replace('{{date}}', dateStr)
     .replace('{{time}}', timeStr)
-    .replace('{{timezone}}', 'SGT');
+    .replace('{{timezone}}', 'SGT') + prefContext;
 
   // Inject user's bookmark preferences if available (#12)
   try {
@@ -226,6 +343,7 @@ async function generateForUser(db, userId, userName, type, dryRun) {
   const metadata = JSON.stringify({
     source_count: sourceIds.length,
     item_count: items.length,
+    dedup_removed: dedupCount,
     subscription_hash: subHash,
     model: LLM_MODEL,
   });
@@ -277,10 +395,17 @@ async function generateSystemDigest(db, type, dryRun) {
   }
 
   const since = lastSystem?.created_at || undefined;
-  const items = listRawItemsForDigest(db, sourceIds, { since, limit: MAX_ITEMS });
-  if (!items.length) {
+  const rawItems = listRawItemsForDigest(db, sourceIds, { since, limit: MAX_ITEMS });
+  if (!rawItems.length) {
     console.log('  [skip] No new items for system digest');
     return null;
+  }
+
+  // Cross-source deduplication
+  const items = deduplicateItems(rawItems);
+  const dedupCount = rawItems.length - items.length;
+  if (dedupCount > 0) {
+    console.log(`  [dedup] System digest: ${dedupCount} duplicates removed`);
   }
 
   console.log(`  [gen] System digest: ${items.length} items from ${sourceIds.length} public sources`);

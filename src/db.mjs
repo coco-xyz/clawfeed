@@ -158,6 +158,17 @@ export function getDb(dbPath) {
   } catch (e) {
     if (!e.message.includes('already exists') && !e.message.includes('duplicate column')) console.error('Migration 014:', e.message);
   }
+  // Migration 015: digest quality (source weights, item feedback, topics)
+  try {
+    const sql15 = readFileSync(join(ROOT, 'migrations', '015_digest_quality.sql'), 'utf8');
+    for (const stmt of sql15.split(';').map(s => s.trim()).filter(Boolean)) {
+      try { _db.exec(stmt + ';'); } catch (e) {
+        if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) throw e;
+      }
+    }
+  } catch (e) {
+    if (!e.message.includes('duplicate column') && !e.message.includes('already exists')) console.error('Migration 015:', e.message);
+  }
   // Backfill slugs for existing users
   _backfillSlugs(_db);
   return _db;
@@ -840,4 +851,90 @@ export function logPush(db, userId, channel, digestId, status, error) {
   return db.prepare(
     'INSERT INTO push_log (user_id, channel, digest_id, status, error) VALUES (?, ?, ?, ?, ?)'
   ).run(userId, channel, digestId || null, status, error || null);
+}
+
+// ── Source Weights ──
+
+export function getSubscriptionWeight(db, userId, sourceId) {
+  const row = db.prepare('SELECT weight FROM user_subscriptions WHERE user_id = ? AND source_id = ?').get(userId, sourceId);
+  return row ? row.weight : 1.0;
+}
+
+export function setSubscriptionWeight(db, userId, sourceId, weight) {
+  return db.prepare('UPDATE user_subscriptions SET weight = ? WHERE user_id = ? AND source_id = ?').run(weight, userId, sourceId);
+}
+
+export function getSubscriptionWeights(db, userId) {
+  return db.prepare(
+    'SELECT us.source_id, us.weight, s.name as source_name FROM user_subscriptions us JOIN sources s ON us.source_id = s.id WHERE us.user_id = ? AND s.is_deleted = 0'
+  ).all(userId);
+}
+
+// ── Item Feedback ──
+
+export function upsertItemFeedback(db, userId, itemUrl, itemTitle, signal) {
+  return db.prepare(
+    `INSERT INTO item_feedback (user_id, item_url, item_title, signal)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, item_url) DO UPDATE SET signal = excluded.signal, created_at = datetime('now')`
+  ).run(userId, itemUrl, itemTitle || '', signal);
+}
+
+export function getItemFeedback(db, userId, { limit = 50 } = {}) {
+  return db.prepare(
+    'SELECT * FROM item_feedback WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'
+  ).all(userId, limit);
+}
+
+export function getItemFeedbackSummary(db, userId) {
+  return db.prepare(
+    `SELECT signal, COUNT(*) as count FROM item_feedback WHERE user_id = ? GROUP BY signal`
+  ).all(userId);
+}
+
+export function getRecentHelpfulUrls(db, userId, limit = 20) {
+  return db.prepare(
+    "SELECT item_url, item_title FROM item_feedback WHERE user_id = ? AND signal = 'helpful' ORDER BY created_at DESC LIMIT ?"
+  ).all(userId, limit);
+}
+
+export function getRecentNotHelpfulUrls(db, userId, limit = 20) {
+  return db.prepare(
+    "SELECT item_url, item_title FROM item_feedback WHERE user_id = ? AND signal = 'not_helpful' ORDER BY created_at DESC LIMIT ?"
+  ).all(userId, limit);
+}
+
+// ── User Topics ──
+
+export function upsertUserTopic(db, userId, topic, score, source) {
+  return db.prepare(
+    `INSERT INTO user_topics (user_id, topic, score, source)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, topic) DO UPDATE SET score = excluded.score, source = excluded.source, updated_at = datetime('now')`
+  ).run(userId, topic.toLowerCase().trim(), score || 1.0, source || 'manual');
+}
+
+export function removeUserTopic(db, userId, topic) {
+  return db.prepare('DELETE FROM user_topics WHERE user_id = ? AND topic = ?').run(userId, topic.toLowerCase().trim());
+}
+
+export function getUserTopics(db, userId) {
+  return db.prepare('SELECT * FROM user_topics WHERE user_id = ? ORDER BY score DESC').all(userId);
+}
+
+// ── Weighted item query for digest ──
+
+export function listRawItemsForDigestWeighted(db, userId, sourceIds, { since, limit = 500 } = {}) {
+  if (!sourceIds.length) return [];
+  const placeholders = sourceIds.map(() => '?').join(',');
+  let sql = `SELECT ri.*, s.name as source_name, s.type as source_type, COALESCE(us.weight, 1.0) as source_weight
+    FROM raw_items ri
+    JOIN sources s ON ri.source_id = s.id
+    LEFT JOIN user_subscriptions us ON us.source_id = ri.source_id AND us.user_id = ?
+    WHERE ri.source_id IN (${placeholders})`;
+  const params = [userId, ...sourceIds];
+  if (since) { sql += ' AND ri.fetched_at >= ?'; params.push(since); }
+  sql += ' ORDER BY ri.fetched_at DESC LIMIT ?';
+  params.push(Math.min(limit, 1000));
+  return db.prepare(sql).all(...params);
 }
