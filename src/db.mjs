@@ -268,13 +268,14 @@ export function revokeMarkShare(db, id, userId) {
   return db.prepare('UPDATE marks SET share_token = NULL WHERE id = ? AND user_id = ?').run(id, userId);
 }
 
-export function listMarksForExport(db, userId, { status, since, until } = {}) {
+export function listMarksForExport(db, userId, { status, since, until, limit = 1000 } = {}) {
   let sql = 'SELECT * FROM marks WHERE user_id = ?';
   const params = [userId];
   if (status) { sql += ' AND status = ?'; params.push(status); }
   if (since) { sql += ' AND created_at >= ?'; params.push(since); }
   if (until) { sql += ' AND created_at <= ?'; params.push(until); }
-  sql += ' ORDER BY created_at DESC';
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(limit);
   return db.prepare(sql).all(...params);
 }
 

@@ -44,8 +44,9 @@ const LLM_TIMEOUT = parseInt(process.env.LLM_TIMEOUT || env.LLM_TIMEOUT || '90',
 mkdirSync(join(ROOT, 'data'), { recursive: true });
 const db = getDb(DB_PATH);
 
-// Chat rate limiting (in-memory, per user)
+// Rate limiting (in-memory, per user)
 const chatRateLimit = new Map();
+const analyzeRateLimit = new Map();
 
 // ── Shared LLM helper ──
 function callLlmApi(messages, { maxTokens = 1024, temperature = 0.3 } = {}) {
@@ -663,15 +664,26 @@ const server = createServer(async (req, res) => {
     }
 
     // POST /api/marks/:id/analyze — trigger AI analysis for a mark
+    // Rate limit: 5 requests per minute per user (M-1: prevent LLM quota abuse)
     const markAnalyzeMatch = path.match(/^\/api\/marks\/(\d+)\/analyze$/);
     if (req.method === 'POST' && markAnalyzeMatch) {
       if (!req.user) return json(res, { error: 'not authenticated' }, 401);
       if (!LLM_API_KEY) return json(res, { error: 'analysis not configured' }, 503);
+      const now = Date.now();
+      const uid = req.user.id;
+      if (!analyzeRateLimit.has(uid)) analyzeRateLimit.set(uid, []);
+      const ts = analyzeRateLimit.get(uid).filter(t => now - t < 60000);
+      if (ts.length >= 5) return json(res, { error: 'rate limit exceeded, try again later' }, 429);
+      ts.push(now);
+      analyzeRateLimit.set(uid, ts);
       const markId = parseInt(markAnalyzeMatch[1]);
       const mark = getMark(db, markId, req.user.id);
       if (!mark) return json(res, { error: 'mark not found' }, 404);
 
       try {
+        // User-supplied title/note/URL are interpolated into the prompt. Prompt injection
+        // risk is low: analysis is stored in the user's own mark and only shared if the
+        // user explicitly creates a share link (user-initiated action).
         const analysisPrompt = `Analyze this bookmarked article and provide a structured analysis.
 
 Title: ${(mark.title || '').slice(0, 200)}
@@ -725,11 +737,10 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
       return json(res, { share_token: token, url: `/api/marks/shared/${token}` });
     }
 
-    // DELETE /api/marks/:id/share — revoke share link
-    const markUnshareMatch = path.match(/^\/api\/marks\/(\d+)\/share$/);
-    if (req.method === 'DELETE' && markUnshareMatch) {
+    // DELETE /api/marks/:id/share — revoke share link (L-1: reuse markShareMatch)
+    if (req.method === 'DELETE' && markShareMatch) {
       if (!req.user) return json(res, { error: 'not authenticated' }, 401);
-      const markId = parseInt(markUnshareMatch[1]);
+      const markId = parseInt(markShareMatch[1]);
       revokeMarkShare(db, markId, req.user.id);
       return json(res, { ok: true });
     }
