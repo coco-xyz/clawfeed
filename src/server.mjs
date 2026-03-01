@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import { randomBytes, createHmac, timingSafeEqual } from 'crypto';
 import { lookup } from 'dns/promises';
 import { isIP } from 'net';
-import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount, listRawItems, getRawItemStats, listRawItemsForDigest, getCollectorStatus, getActiveSubscriptionSourceIds, getLastDigestTime, getEmailPreference, upsertEmailPreference, getEmailPrefByToken, getTelegramLink, consumeLinkCode, saveTelegramLink, removeTelegramLink, updateTelegramPrefs } from './db.mjs';
+import { getDb, listDigests, getDigest, createDigest, listMarks, createMark, deleteMark, getConfig, setConfig, upsertUser, createSession, getSession, deleteSession, listSources, getSource, createSource, updateSource, deleteSource, getSourceByTypeConfig, getUserBySlug, listDigestsByUser, countDigestsByUser, createPack, getPack, getPackBySlug, listPacks, incrementPackInstall, deletePack, listSubscriptions, subscribe, unsubscribe, bulkSubscribe, isSubscribed, createFeedback, getUserFeedback, getAllFeedback, replyToFeedback, updateFeedbackStatus, markFeedbackRead, getUnreadFeedbackCount, listRawItems, getRawItemStats, listRawItemsForDigest, getCollectorStatus, getActiveSubscriptionSourceIds, getLastDigestTime, getEmailPreference, upsertEmailPreference, getEmailPrefByToken, getTelegramLink, consumeLinkCode, saveTelegramLink, removeTelegramLink, updateTelegramPrefs, getSubscriptionWeights, setSubscriptionWeight, upsertItemFeedback, getItemFeedback, getItemFeedbackSummary, upsertUserTopic, removeUserTopic, getUserTopics } from './db.mjs';
 import { fork } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -641,6 +641,74 @@ const server = createServer(async (req, res) => {
     if (req.method === 'DELETE' && subMatch) {
       if (!req.user) return json(res, { error: 'not authenticated' }, 401);
       unsubscribe(db, req.user.id, parseInt(subMatch[1]));
+      return json(res, { ok: true });
+    }
+
+    // ── Source Weights ──
+
+    if (req.method === 'GET' && path === '/api/subscriptions/weights') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getSubscriptionWeights(db, req.user.id));
+    }
+
+    if (req.method === 'PUT' && path === '/api/subscriptions/weights') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { sourceId, weight } = body;
+      if (!sourceId) return json(res, { error: 'sourceId required' }, 400);
+      const w = parseFloat(weight);
+      if (isNaN(w) || w < 0 || w > 5) return json(res, { error: 'weight must be 0-5' }, 400);
+      setSubscriptionWeight(db, req.user.id, sourceId, w);
+      return json(res, { ok: true, sourceId, weight: w });
+    }
+
+    // ── Item Feedback ──
+
+    if (req.method === 'GET' && path === '/api/item-feedback') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const limit = Math.min(parseInt(params.get('limit') || '50', 10), 200);
+      return json(res, getItemFeedback(db, req.user.id, { limit }));
+    }
+
+    if (req.method === 'GET' && path === '/api/item-feedback/summary') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getItemFeedbackSummary(db, req.user.id));
+    }
+
+    if (req.method === 'POST' && path === '/api/item-feedback') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { itemUrl, itemTitle, signal } = body;
+      if (!itemUrl) return json(res, { error: 'itemUrl required' }, 400);
+      if (!signal || !['helpful', 'not_helpful'].includes(signal)) return json(res, { error: 'signal must be helpful or not_helpful' }, 400);
+      upsertItemFeedback(db, req.user.id, itemUrl, itemTitle || '', signal);
+      return json(res, { ok: true });
+    }
+
+    // ── User Topics ──
+
+    if (req.method === 'GET' && path === '/api/topics') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      return json(res, getUserTopics(db, req.user.id));
+    }
+
+    if (req.method === 'POST' && path === '/api/topics') {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const body = await parseBody(req);
+      const { topic, score } = body;
+      if (!topic || typeof topic !== 'string' || !topic.trim()) return json(res, { error: 'topic required' }, 400);
+      if (topic.trim().length > 100) return json(res, { error: 'topic too long' }, 400);
+      const s = parseFloat(score) || 1.0;
+      if (s < 0 || s > 5) return json(res, { error: 'score must be 0-5' }, 400);
+      upsertUserTopic(db, req.user.id, topic.trim(), s, 'manual');
+      return json(res, { ok: true });
+    }
+
+    if (req.method === 'DELETE' && path.startsWith('/api/topics/')) {
+      if (!req.user) return json(res, { error: 'not authenticated' }, 401);
+      const topic = decodeURIComponent(path.slice('/api/topics/'.length));
+      if (!topic) return json(res, { error: 'topic required' }, 400);
+      removeUserTopic(db, req.user.id, topic);
       return json(res, { ok: true });
     }
 
