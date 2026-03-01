@@ -586,6 +586,152 @@ else
 fi
 
 # ═══════════════════════════════════════════
+# 19. DIGEST QUALITY — weights, feedback, topics
+# ═══════════════════════════════════════════
+echo ""
+echo "─── 19. Digest Quality (weights, feedback, topics) ───"
+
+# 19.1 Source weights — list (default all 1.0)
+r=$(curl -s "$API/subscriptions/weights" -H "$ALICE")
+check "19.1 Weights list" '"weight"' "$r"
+
+# 19.2 Set weight for a source
+# Get Alice's first subscription source ID
+A_FIRST_SRC=$(sqlite3 "$AI_DIGEST_DB" "SELECT source_id FROM user_subscriptions WHERE user_id=(SELECT id FROM users WHERE name='Alice (Test)') LIMIT 1" 2>/dev/null)
+if [ -n "$A_FIRST_SRC" ]; then
+  r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+    -d "{\"sourceId\":$A_FIRST_SRC,\"weight\":2.5}")
+  check "19.2 Set weight 2.5" '"ok":true' "$r"
+
+  # 19.3 Verify weight persisted
+  r=$(curl -s "$API/subscriptions/weights" -H "$ALICE")
+  check "19.3 Weight = 2.5" '2.5' "$r"
+else
+  SKIP=$((SKIP+2))
+  echo "  ⏭ 19.2-19.3 Skipped (no subscriptions)"
+fi
+
+# 19.4 Invalid weight → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":10}')
+check "19.4 Weight > 5 → 400" '"error"' "$r"
+
+# 19.5 Weight without sourceId → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"weight":1.0}')
+check "19.5 No sourceId → 400" '"error"' "$r"
+
+# 19.6 Visitor can't set weight
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":1.0}')
+check "19.6 Visitor → 401" '"error"' "$r"
+
+# ── Item Feedback ──
+
+# 19.7 Submit helpful feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/great-article","itemTitle":"Great Article","signal":"helpful"}')
+check "19.7 Helpful feedback" '"ok":true' "$r"
+
+# 19.8 Submit not_helpful feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/bad-article","itemTitle":"Bad Article","signal":"not_helpful"}')
+check "19.8 Not helpful feedback" '"ok":true' "$r"
+
+# 19.9 List feedback
+r=$(curl -s "$API/item-feedback" -H "$ALICE")
+check "19.9 List feedback" '"helpful"' "$r"
+check "19.9b List feedback (2 items)" '"not_helpful"' "$r"
+
+# 19.10 Feedback summary
+r=$(curl -s "$API/item-feedback/summary" -H "$ALICE")
+check "19.10 Feedback summary" '"count"' "$r"
+
+# 19.11 Invalid signal → 400
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://x.com/foo","signal":"maybe"}')
+check "19.11 Invalid signal → 400" '"error"' "$r"
+
+# 19.12 Missing itemUrl → 400
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"signal":"helpful"}')
+check "19.12 No itemUrl → 400" '"error"' "$r"
+
+# 19.13 Upsert: change signal
+r=$(curl -s -X POST "$API/item-feedback" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://example.com/great-article","signal":"not_helpful"}')
+check "19.13 Upsert feedback" '"ok":true' "$r"
+
+# 19.14 Visitor can't submit feedback
+r=$(curl -s -X POST "$API/item-feedback" -H "Content-Type: application/json" \
+  -d '{"itemUrl":"https://x.com/foo","signal":"helpful"}')
+check "19.14 Visitor → 401" '"error"' "$r"
+
+# 19.15 Bob can't see Alice's feedback
+r=$(curl -s "$API/item-feedback" -H "$BOB")
+check_not "19.15 Data isolation" 'great-article' "$r"
+
+# ── Topics ──
+
+# 19.16 Add topic
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"AI Research","score":2.0}')
+check "19.16 Add topic" '"ok":true' "$r"
+
+# 19.17 Add another topic
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"Rust Programming"}')
+check "19.17 Add topic (default score)" '"ok":true' "$r"
+
+# 19.18 List topics
+r=$(curl -s "$API/topics" -H "$ALICE")
+check "19.18 List topics" '"ai research"' "$r"
+check "19.18b Second topic" '"rust programming"' "$r"
+
+# 19.19 Update topic score (upsert)
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"AI Research","score":3.5}')
+check "19.19 Upsert topic" '"ok":true' "$r"
+
+# 19.20 Delete topic
+r=$(curl -s -X DELETE "$API/topics/rust%20programming" -H "$ALICE")
+check "19.20 Delete topic" '"ok":true' "$r"
+
+# 19.21 Verify deletion
+r=$(curl -s "$API/topics" -H "$ALICE")
+check_not "19.21 Topic removed" 'rust programming' "$r"
+
+# 19.22 Empty topic → 400
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":""}')
+check "19.22 Empty topic → 400" '"error"' "$r"
+
+# 19.23 Topic too long → 400
+LONG_TOPIC=$(python3 -c "print('x' * 101)")
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d "{\"topic\":\"$LONG_TOPIC\"}")
+check "19.23 Long topic → 400" '"error"' "$r"
+
+# 19.24 Visitor can't add topic
+r=$(curl -s -X POST "$API/topics" -H "Content-Type: application/json" \
+  -d '{"topic":"whatever"}')
+check "19.24 Visitor → 401" '"error"' "$r"
+
+# 19.25 Bob can't see Alice's topics
+r=$(curl -s "$API/topics" -H "$BOB")
+check_not "19.25 Topic isolation" 'ai research' "$r"
+
+# 19.26 Invalid weight (negative) → 400
+r=$(curl -s -X PUT "$API/subscriptions/weights" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"sourceId":1,"weight":-1}')
+check "19.26 Negative weight → 400" '"error"' "$r"
+
+# 19.27 Score out of range → 400
+r=$(curl -s -X POST "$API/topics" -H "$ALICE" -H "Content-Type: application/json" \
+  -d '{"topic":"test","score":10}')
+check "19.27 Score > 5 → 400" '"error"' "$r"
+
+# ═══════════════════════════════════════════
 # RESULTS
 # ═══════════════════════════════════════════
 echo ""
