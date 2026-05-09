@@ -1208,8 +1208,13 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
 
     // ── Chat endpoint ──
     if (req.method === 'POST' && path === '/api/chat') {
-      if (!LLM_API_KEY) return json(res, { error: 'chat not configured' }, 503);
       if (!req.user) return json(res, { error: 'login required' }, 401);
+
+      const body = await parseBody(req);
+      const { message, history, digest_id } = body;
+      if (!message || typeof message !== 'string') return json(res, { error: 'message required' }, 400);
+
+      if (!LLM_API_KEY) return json(res, { error: 'chat not configured' }, 503);
 
       // Rate limit: max 20 requests per minute per user
       const now = Date.now();
@@ -1219,10 +1224,6 @@ Format the analysis in clear markdown. Return the topic tags as a JSON array on 
       if (timestamps.length >= 20) return json(res, { error: 'rate limit exceeded, try again later' }, 429);
       timestamps.push(now);
       chatRateLimit.set(userId, timestamps);
-
-      const body = await parseBody(req);
-      const { message, history, digest_id } = body;
-      if (!message || typeof message !== 'string') return json(res, { error: 'message required' }, 400);
 
       // Get digest content for context
       let digestContent = '';
