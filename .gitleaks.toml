@@ -1,0 +1,10 @@
+# Gitleaks configuration
+# Pre-existing findings in historical commits are allowlisted below.
+# New secrets introduced after this PR will still be caught.
+
+[allowlist]
+description = "Pre-existing findings in historical commits"
+commits = [
+  # docs/STAGING.md line 42: placeholder staging API key in curl example (not a real credential)
+  "554b84bd20514c0dd4ff76092e2fa44e7c000226",
+]
